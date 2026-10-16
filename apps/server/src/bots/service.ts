@@ -14,6 +14,7 @@ import {
   findUserById,
   findUserByUsername,
   insertBotUser,
+  isDuplicateUsernameError,
   listBots,
   parsePermissionBits,
   presentUser,
@@ -89,11 +90,24 @@ export function createBotService(sqlite: DatabaseSync): BotService {
     },
 
     create({ username, displayName, permissions }) {
+      // An early, friendlier refusal. It is not the guard: the username unique
+      // index is, and it is shared with every other writer of `users`, so a
+      // name can be taken between this lookup and the insert below.
       if (findUserByUsername(sqlite, username)) {
         throw new HttpError(409, 'username_taken', 'That username is already taken.');
       }
       const id = randomUUID();
-      insertBotUser(sqlite, { id, username, permissions: permissionsToString(maskPermissions(permissions)) });
+      try {
+        insertBotUser(sqlite, { id, username, permissions: permissionsToString(maskPermissions(permissions)) });
+      } catch (error) {
+        // Surface a lost race against the index as the same stable 409 the
+        // lookup returns, rather than a raw constraint error that becomes a 500.
+        // `create` is synchronous today, but the failure must not depend on that.
+        if (isDuplicateUsernameError(error)) {
+          throw new HttpError(409, 'username_taken', 'That username is already taken.');
+        }
+        throw error;
+      }
       if (displayName) updateUserProfile(sqlite, id, { displayName });
       const token = generateSessionToken();
       setBotToken(sqlite, id, token);

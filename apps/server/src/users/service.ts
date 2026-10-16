@@ -21,6 +21,7 @@ import {
   findUserById,
   findUserByDiscordId,
   findUserByUsername,
+  isDuplicateUsernameError,
   mergeUsers,
   setDiscordAvatarSync,
   setUserDiscordId,
@@ -274,6 +275,9 @@ export function createUserService(sqlite: DatabaseSync, config: Config): UserSer
       const row = require(userId);
       assertEditable(row);
 
+      // An early, friendlier refusal; the unique index on `users.username` is
+      // the real guard (see the catch below), since the password hash yields the
+      // event loop and lets another rename to the same name win in between.
       if (patch.username !== undefined && patch.username !== row.username) {
         const taken = findUserByUsername(sqlite, patch.username);
         if (taken && taken.id !== row.id) {
@@ -284,7 +288,17 @@ export function createUserService(sqlite: DatabaseSync, config: Config): UserSer
       const account: { username?: string; passwordHash?: string } = {};
       if (patch.username !== undefined) account.username = patch.username;
       if (patch.password !== undefined) account.passwordHash = await hashPassword(patch.password);
-      updateUserAccount(sqlite, row.id, account);
+      try {
+        updateUserAccount(sqlite, row.id, account);
+      } catch (error) {
+        // Translate a lost race against the index into the same stable 409 the
+        // lookup returns, instead of letting the raw constraint error become a
+        // 500. Anything else is a real failure and is re-thrown unchanged.
+        if (isDuplicateUsernameError(error)) {
+          throw new HttpError(409, 'username_taken', 'That username is already taken.');
+        }
+        throw error;
+      }
 
       if (patch.displayName !== undefined) {
         const trimmed = patch.displayName?.trim() ?? '';

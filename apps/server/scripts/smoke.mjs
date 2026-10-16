@@ -26,10 +26,12 @@ import { isKlipyAddress, klipySearchUrl, normalizeKlipySearch } from '../src/gif
 import { createServerGifService } from '../src/gifs/server-gifs.ts';
 import { parseMessageEmbed } from '../src/db/messages.ts';
 import { Database } from '../src/db/index.ts';
-import { insertBotUser, insertGhostUser, insertUser, mergeUsers } from '../src/db/users.ts';
+import { insertBotUser, insertGhostUser, insertUser, isDuplicateUsernameError, mergeUsers } from '../src/db/users.ts';
 import { insertInvite } from '../src/db/invites.ts';
 import { insertBan } from '../src/db/bans.ts';
 import { createAuthService } from '../src/auth/service.ts';
+import { NO_PASSWORD } from '../src/auth/passwords.ts';
+import { createBotService } from '../src/bots/service.ts';
 import { createDiscordOAuthService } from '../src/auth/discord-oauth.ts';
 import { insertChannel } from '../src/db/channels.ts';
 import { insertMessage } from '../src/db/messages.ts';
@@ -5496,6 +5498,98 @@ try {
 
   ghostStore.close();
   rmSync(ghostDir, { recursive: true, force: true });
+
+  // A username is held by the users.username unique index, not by the pre-write
+  // lookup, which can be raced while a request awaits. Two writers of `users`
+  // look the name up first: an administrator renaming an account (whose password
+  // hash yields the event loop before the rename UPDATE) and bots.create (whose
+  // insert shares the same index). The loser must answer with the same stable
+  // 409 the lookup produces, never a 500 from the raw constraint error. Each case
+  // runs on its own throwaway instance so nothing else is in play.
+
+  // -- bots.create(): the bot insert shares users.username with everyone else.
+  const dupBotDir = mkdtempSync(join(tmpdir(), 'harmony-dup-bot-'));
+  const dupBotStore = new Database({
+    dataDir: dupBotDir,
+    dbFile: join(dupBotDir, 'harmony.db'),
+    uploadDir: join(dupBotDir, 'uploads'),
+  });
+  const dupBots = createBotService(dupBotStore.sqlite);
+  const dupBotResults = await Promise.allSettled([
+    Promise.resolve().then(() => dupBots.create({ username: 'racerbot', displayName: null, permissions: 0n })),
+    Promise.resolve().then(() => dupBots.create({ username: 'racerbot', displayName: null, permissions: 0n })),
+  ]);
+  const dupBotWon = dupBotResults.filter((result) => result.status === 'fulfilled').length;
+  const dupBotLost = dupBotResults.filter(
+    (result) =>
+      result.status === 'rejected' &&
+      result.reason?.statusCode === 409 &&
+      result.reason?.code === 'username_taken',
+  ).length;
+  const dupBotRows = dupBotStore.sqlite
+    .prepare("SELECT COUNT(*) AS n FROM users WHERE account_type = 'bot' AND username = 'racerbot'")
+    .get().n;
+  check(
+    'a second bot with the same name yields one bot and one 409 username_taken',
+    dupBotWon === 1 && dupBotLost === 1 && dupBotRows === 1,
+    `won ${dupBotWon}, lost ${dupBotLost}, other ${dupBotResults.length - dupBotWon - dupBotLost}, bots ${dupBotRows}`,
+  );
+  // The predicate must recognise the exact failure insertBotUser raises, so the
+  // try/catch around that insert is really what stands between a lost race and a 500.
+  let dupBotRawRecognised = false;
+  try {
+    insertBotUser(dupBotStore.sqlite, { id: 'raw-dup', username: 'racerbot', permissions: '0' });
+  } catch (error) {
+    dupBotRawRecognised = isDuplicateUsernameError(error);
+  }
+  check('the raw insertBotUser duplicate is the failure the 409 translation matches', dupBotRawRecognised);
+  dupBotStore.close();
+  rmSync(dupBotDir, { recursive: true, force: true });
+
+  // -- users.adminUpdate(): the password hash yields before the rename UPDATE.
+  const dupRenameDir = mkdtempSync(join(tmpdir(), 'harmony-dup-rename-'));
+  const dupRenameStore = new Database({
+    dataDir: dupRenameDir,
+    dbFile: join(dupRenameDir, 'harmony.db'),
+    uploadDir: join(dupRenameDir, 'uploads'),
+  });
+  insertUser(dupRenameStore.sqlite, {
+    id: 'rename-a',
+    username: 'renamea',
+    passwordHash: NO_PASSWORD,
+    isOwner: false,
+  });
+  insertUser(dupRenameStore.sqlite, {
+    id: 'rename-b',
+    username: 'renameb',
+    passwordHash: NO_PASSWORD,
+    isOwner: false,
+  });
+  const dupRenameUsers = createUserService(dupRenameStore.sqlite, {
+    dataDir: dupRenameDir,
+    uploadDir: join(dupRenameDir, 'uploads'),
+  });
+  const dupRenameResults = await Promise.allSettled([
+    dupRenameUsers.adminUpdate('rename-a', { username: 'sharedname', password: 'hunter2hunter2' }),
+    dupRenameUsers.adminUpdate('rename-b', { username: 'sharedname', password: 'hunter2hunter2' }),
+  ]);
+  const dupRenameWon = dupRenameResults.filter((result) => result.status === 'fulfilled').length;
+  const dupRenameLost = dupRenameResults.filter(
+    (result) =>
+      result.status === 'rejected' &&
+      result.reason?.statusCode === 409 &&
+      result.reason?.code === 'username_taken',
+  ).length;
+  const dupRenameRows = dupRenameStore.sqlite
+    .prepare("SELECT COUNT(*) AS n FROM users WHERE username = 'sharedname'")
+    .get().n;
+  check(
+    'a raced admin rename yields one holder of the name and one 409 username_taken',
+    dupRenameWon === 1 && dupRenameLost === 1 && dupRenameRows === 1,
+    `won ${dupRenameWon}, lost ${dupRenameLost}, other ${dupRenameResults.length - dupRenameWon - dupRenameLost}, holders ${dupRenameRows}`,
+  );
+  dupRenameStore.close();
+  rmSync(dupRenameDir, { recursive: true, force: true });
 
   // --- Slowmode ---
   const slowChannel = await req('/channels', {

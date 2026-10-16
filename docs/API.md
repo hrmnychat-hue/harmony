@@ -2484,6 +2484,9 @@ and connection the member has, so they sign back in with the new one. Returns
 `{ "user": { /* LinkedUser */ } }` and fires `MEMBER_UPDATE`; the fields that changed are recorded as a
 `member_update` entry, and a password as a `password_reset` entry.
 
+A name is held by the `users.username` unique index, so if two renames to the same name race — the
+password hash yields before the write — one wins and the other answers `409 username_taken`, never a 500.
+
 `discordId` links the member to a Discord account, which is how a member and the Discord stand-in
 built for them become one identity — see [Linking a Discord account](#linking-a-discord-account).
 An empty string or `null` clears the link, and a malformed id (it is 17–20 digits) is
@@ -2832,7 +2835,8 @@ type BotSummary = {
 `{ "username": string, "displayName"?: string | null, "permissions": string }`. The permissions are a
 decimal bitfield; bits this instance does not know are dropped. Returns
 `{ "bot": BotSummary, "token": string }`, the only time the token is shown. `409 username_taken` if
-the name is already in use.
+the name is already in use — the `users.username` unique index is the guard, so a name raced by another
+writer still yields one bot and one `409`, not a 500.
 
 #### `PATCH /api/v1/bots/:id` — owner only
 
