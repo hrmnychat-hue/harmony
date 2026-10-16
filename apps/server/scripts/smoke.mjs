@@ -53,7 +53,23 @@ import { sanitizeDetail, sanitizeLogText } from '../src/log/sanitize.ts';
 import { createHttpPushSender } from '../src/push/sender.ts';
 
 const serverDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const PORT = 8791;
+
+/**
+ * The port the throwaway server listens on. 8791 is the historical default, so a
+ * single run behaves exactly as it always has; HARMONY_SMOKE_PORT overrides it so
+ * two smoke runs on one host can be pointed at distinct ports instead of racing
+ * for the same listener.
+ */
+function smokePort(value) {
+  if (value === undefined || value === '') return 8791;
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`HARMONY_SMOKE_PORT must be a whole port number between 1 and 65535, got "${value}"`);
+  }
+  return port;
+}
+
+const PORT = smokePort(process.env.HARMONY_SMOKE_PORT);
 const ORIGIN = `http://127.0.0.1:${PORT}`;
 const BASE = `${ORIGIN}/api/v1`;
 const HEARTBEAT_MS = 1000;
@@ -62,7 +78,15 @@ const dataDir = mkdtempSync(join(tmpdir(), 'harmony-smoke-'));
 // A stand-in for the built client, so the static serving and SPA fallback can be
 // exercised without depending on whether anyone ran `npm run build:web` first.
 const webDir = mkdtempSync(join(tmpdir(), 'harmony-web-'));
-writeFileSync(join(webDir, 'index.html'), '<!doctype html><title>Harmony test shell</title><div id="app"></div>');
+// A token unique to this run, embedded in the throwaway shell. The readiness
+// poll below looks for it, which proves the server answering on PORT is the one
+// this run just spawned: a second run sharing the port would serve its own
+// shell, carrying a different token, and be refused instead of silently driven.
+const RUN_TOKEN = randomBytes(16).toString('hex');
+writeFileSync(
+  join(webDir, 'index.html'),
+  `<!doctype html><title>Harmony test shell</title><div id="app" data-run="${RUN_TOKEN}"></div>`,
+);
 // A stand-in default icon, so the on-demand icon rendering has a source even
 // without a real client build. Deliberately a picture rather than a flat color:
 // it is fully opaque, and it reaches every edge, which is what the checks further
@@ -230,12 +254,29 @@ function gatewayIdentify(token, extra = {}) {
 
 async function waitForServer() {
   for (let attempt = 0; attempt < 60; attempt++) {
+    // A server that cannot bind its port exits. Stop waiting the moment the
+    // child is gone, rather than polling a listener that belongs to another run.
+    if (server.exitCode !== null || server.signalCode !== null) {
+      throw new Error(
+        `the server exited before it was ready (code ${server.exitCode ?? server.signalCode}); ` +
+          `is port ${PORT} already in use? set HARMONY_SMOKE_PORT to a free port`,
+      );
+    }
     try {
-      if ((await fetch(`${BASE}/health`)).ok) return;
+      if ((await fetch(`${BASE}/health`)).ok) {
+        // Health answering is not enough: prove the listener is ours by asking
+        // for this run's shell token. A different server squatting on PORT would
+        // pass the health check but not this one.
+        const shell = await fetch(`${ORIGIN}/`);
+        if ((await shell.text()).includes(RUN_TOKEN)) return;
+      }
     } catch {}
     await sleep(250);
   }
-  throw new Error('server did not start in time');
+  throw new Error(
+    `the server did not start in time, or port ${PORT} is held by another server; ` +
+      `set HARMONY_SMOKE_PORT to a free port`,
+  );
 }
 
 try {
